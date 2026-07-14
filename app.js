@@ -118,7 +118,7 @@ function applyAppConfig() {
 
   const titleEl = document.getElementById("app-title");
   if (titleEl) {
-    titleEl.textContent = `${appName} (MAX/MLX 4台統合計測)`;
+    titleEl.textContent = `${appName}`;
   }
 }
 
