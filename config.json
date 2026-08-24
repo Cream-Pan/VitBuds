@@ -30,9 +30,13 @@
       },
       "deviceNames": [
         "MAX R",
-        "MAX R mini",
+        "MAX R2",
+        "MAX R3",
+        "MAX R4",
         "MAX L",
-        "MAX L mini",
+        "MAX L2",
+        "MAX L3",
+        "MAX L4",
         "MAX fin",
         "MAX earlobe"
       ]
@@ -44,9 +48,13 @@
       "plotCount": 50,
       "deviceNames": [
         "MLX R",
-        "MLX R mini",
+        "MLX R2",
+        "MLX R3",
+        "MLX R4",
         "MLX L",
-        "MLX L mini",
+        "MLX L2",
+        "MLX L3",
+        "MLX L4",
         "MLX ref"
       ]
     }
