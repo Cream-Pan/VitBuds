@@ -952,11 +952,69 @@ function downloadCsv(deviceName, data, type, timestamp) {
   URL.revokeObjectURL(url);
 }
 
-downloadAllBtn.addEventListener("click", () => {
+downloadAllBtn.addEventListener("click", async () => {
   const timestamp = formatTimestampForFilename();
 
-  Object.values(devices).forEach(dev => {
-    const deviceName = dev.name || dev.id.toUpperCase();
-    downloadCsv(deviceName, dev.data, dev.type, timestamp);
-  });
+  const targetDevices = Object.values(devices)
+    .filter(dev => dev.data.length > 0);
+
+  if (targetDevices.length === 0) {
+    alert("ダウンロードできるデータがありません．");
+    return;
+  }
+
+  const originalText = downloadAllBtn.textContent;
+
+  downloadAllBtn.disabled = true;
+  downloadAllBtn.textContent = "ZIP生成中...";
+
+  try {
+    const zip = new JSZip();
+
+    targetDevices.forEach(dev => {
+      const deviceName = dev.name || dev.id.toUpperCase();
+
+      const rows = buildRows(dev.data, dev.type);
+      const headers = csvHeaders(dev.type);
+      const csv = rowsToCsv(rows, headers);
+
+      const safeName = sanitizeFilename(deviceName);
+      const filename = `${safeName}_${timestamp}.csv`;
+
+      // Excelでの文字化け防止用BOM付きCSV
+      zip.file(filename, "\uFEFF" + csv);
+    });
+
+    const zipBlob = await zip.generateAsync({
+      type: "blob",
+      compression: "DEFLATE",
+      compressionOptions: {
+        level: 6
+      }
+    });
+
+    const zipFilename = `VitBuds_${timestamp}.zip`;
+
+    const url = URL.createObjectURL(zipBlob);
+    const a = document.createElement("a");
+
+    a.href = url;
+    a.download = zipFilename;
+
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+    }, 1000);
+
+  } catch (e) {
+    console.error("ZIP生成エラー:", e);
+    alert("ZIPファイルの生成に失敗しました．");
+
+  } finally {
+    downloadAllBtn.textContent = originalText;
+    updateUnifiedButtons();
+  }
 });
