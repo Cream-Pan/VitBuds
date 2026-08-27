@@ -148,6 +148,7 @@ Ambient 温度，Object 温度，Raw Ambient，Raw Object を受信する．
 | `app.chartUpdateHz` | グラフの描画頻度 [Hz] |
 | `app.numericUiUpdateHz` | 数値表示の更新頻度 [Hz] |
 | `app.samplingRateWindowSeconds` | 実測受信レートの計算窓 [s] |
+| `app.samplingRateStaleAfterSeconds` | 最終受信後に受信停止と判定する時間 [s] |
 | `sensors.MAX.serviceUUID` | MAX の BLE Service UUID |
 | `sensors.MAX.characteristicUUID` | MAX の BLE Characteristic UUID |
 | `sensors.MAX.sampleByteSize` | MAX の1サンプルのバイト数 |
@@ -303,13 +304,13 @@ MAXでは，デバイスBoxごとに個別のグラフを表示する．
 - IR
 - RED
 
-各デバイスBoxのボタンで個別にグラフをON/OFFできる．全体ボタンをOFFにした場合は，すべてのグラフ描画を停止する．グラフをOFFにしても，BLE受信，データ保存，CSV出力は継続する．
+各デバイスBoxのボタンで個別にグラフをON/OFFできる．全体ボタンをOFFにした場合は，すべてのグラフ描画を停止する．初期状態では全グラフをOFFにする．グラフをOFFにしても，BLE受信，データ保存，CSV出力は継続する．また，グラフOFF時はグラフ用点データも生成しない．
 
 IR と RED は別の Y 軸で表示する．横軸には，マイコン側の `SensorElapsed_ms` を基準にした相対時間を用いる．
 
 MAX は1回の Notify に複数サンプルをまとめて送るため，WebApp 側ではパケット形式に応じて全サンプルを復号・保存する．Chart.js の更新はセンサ取得頻度から分離し，`app.chartUpdateHz`で指定した頻度に制限する．数値表示も`app.numericUiUpdateHz`で指定した頻度に制限する．
 
-各デバイスBoxには，直近の受信サンプル数から算出した実測サンプリングレートを表示する．MAXではNotify回数ではなく，パケット内のサンプル数を使用する．MLXの想定値は2 Hzである．
+各デバイスBoxには，直近の受信サンプル数から算出した実測サンプリングレートを表示する．MAXではNotify回数ではなく，パケット内のサンプル数を使用する．MLXの想定値は2 Hzである．Notifyとは独立した監視処理により，最終受信から設定時間が経過した場合は`0.0 Hz（受信停止）`と表示する．
 
 MAX グラフの表示点数は，`sensors.MAX.samplingRateHz × sensors.MAX.chartVisibleSeconds` により決定する．
 
@@ -467,7 +468,7 @@ MLXを接続する場合は，「＋ MLX デバイス追加」を押す．
 
 ### 7．計測を停止する
 
-計測中に「計測停止」ボタンを押すと，各デバイスの通知受信を停止する．
+計測中に「計測停止」ボタンを押すと，各デバイスの通知受信を停止する．開始・停止処理中はボタンを無効化し，処理の重複を防止する．計測中は各Boxの手動解除を無効化する．電池切れや通信状態により1台のBLE接続が予期せず切断された場合は，当該Boxに切断状態を表示し，接続中のほかのデバイスは計測を継続する．ただし，計測開始処理中に切断された場合は，部分的な計測開始を防ぐため全体を停止する．
 
 ### 8．CSVを保存する
 

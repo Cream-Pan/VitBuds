@@ -57,8 +57,22 @@ function updateIntervalMs(configKey, fallbackHz) {
   return 1000 / Math.max(0.1, hz);
 }
 
+const MEASUREMENT_STATE = Object.freeze({
+  IDLE: "idle",
+  STARTING: "starting",
+  MEASURING: "measuring",
+  STOPPING: "stopping"
+});
+
+let measurementState = MEASUREMENT_STATE.IDLE;
+let measurementOperationId = 0;
+
 function isMeasuring() {
-  return measureAllBtn.textContent.includes("停止");
+  return measurementState === MEASUREMENT_STATE.MEASURING;
+}
+
+function isMeasurementBusy() {
+  return measurementState !== MEASUREMENT_STATE.IDLE;
 }
 
 function activeDevices(type = null) {
@@ -154,6 +168,7 @@ const measureAllBtn = document.getElementById("measure-all");
 const downloadAllBtn = document.getElementById("download-all");
 const toggleAllChartsBtn = document.getElementById("toggle-all-charts");
 let allChartsEnabled = true;
+let samplingMonitorTimerId = null;
 
 // ===== 初期化処理 (プルダウン生成) =====
 function init() {
@@ -163,12 +178,20 @@ function init() {
   toggleAllChartsBtn.addEventListener("click", () => {
     allChartsEnabled = !allChartsEnabled;
     Object.values(devices).forEach(dev => {
+      dev.chartEnabled = allChartsEnabled;
       dev.pendingChartPoints = [];
       applyChartVisibility(dev);
     });
     updateAllChartsButton();
   });
   updateAllChartsButton();
+
+  const monitorIntervalMs = updateIntervalMs("numericUiUpdateHz", 2);
+  samplingMonitorTimerId = window.setInterval(() => {
+    if (measurementState !== MEASUREMENT_STATE.MEASURING) return;
+    const nowMs = Date.now();
+    Object.values(devices).forEach(dev => updateSamplingStatus(dev, nowMs));
+  }, monitorIntervalMs);
 
   addButtons.MAX.addEventListener("click", () => createDeviceBox("MAX"));
   addButtons.MLX.addEventListener("click", () => createDeviceBox("MLX"));
@@ -177,7 +200,7 @@ function init() {
 }
 
 function createDeviceBox(type) {
-  if (isMeasuring()) {
+  if (isMeasurementBusy()) {
      alert("計測中はデバイスBoxを追加できません．計測停止後に追加してください．");
      return;
    }
@@ -259,10 +282,11 @@ function createDeviceBox(type) {
     eventHandler: null,
     chart: null,
     sensorBaseMs: null,
-    chartEnabled: CONFIG.app.chartsEnabledByDefault !== false,
+    chartEnabled: allChartsEnabled,
     pendingChartPoints: [],
     pendingUi: null,
     samplingEvents: [],
+    lastSampleReceivedMs: null,
     lastChartUpdateMs: 0,
     lastUiUpdateMs: 0,
     ui: {
@@ -307,6 +331,8 @@ function createDeviceBox(type) {
     dev.chartEnabled = !dev.chartEnabled;
     dev.pendingChartPoints = [];
     applyChartVisibility(dev);
+    allChartsEnabled = Object.values(devices).some(device => device.chartEnabled);
+    updateAllChartsButton();
   });
   applyChartVisibility(dev);
 
@@ -435,7 +461,7 @@ function clearDeviceChart(dev) {
 }
 
 function isChartRenderingEnabled(dev) {
-  return allChartsEnabled && dev.chartEnabled;
+  return dev.chartEnabled;
 }
 
 function applyChartVisibility(dev) {
@@ -458,7 +484,7 @@ async function removeDeviceBox(id) {
   const dev = devices[id];
   if (!dev) return;
 
-  if (isMeasuring()) {
+  if (isMeasurementBusy()) {
     alert("計測中はデバイスBoxを削除できません．計測停止後に削除してください．");
     return;
   }
@@ -532,6 +558,7 @@ function updateMlxChartData(id, elapsedS, obj, nowMs) {
 
 function recordReceivedSamples(dev, sampleCount, nowMs) {
   dev.samplingEvents.push({ timeMs: nowMs, count: sampleCount });
+  dev.lastSampleReceivedMs = nowMs;
 }
 
 function samplingRateResult(dev, nowMs) {
@@ -569,12 +596,19 @@ function samplingRateResult(dev, nowMs) {
   return { measuredHz, status, color };
 }
 
-function updateNumericUi(dev, values, nowMs) {
-  dev.pendingUi = values;
-  if (nowMs - dev.lastUiUpdateMs < updateIntervalMs("numericUiUpdateHz", 2)) return;
+function updateSamplingStatus(dev, nowMs) {
+  if (dev.measureStartEpochMs === null) return;
 
-  const latest = dev.pendingUi;
-  dev.ui.timeValue.textContent = latest.measureElapsedS.toFixed(2);
+  const staleAfterMs = (CONFIG.app.samplingRateStaleAfterSeconds ?? 2) * 1000;
+  const referenceMs = dev.lastSampleReceivedMs ?? dev.measureStartEpochMs;
+
+  if (nowMs - referenceMs >= staleAfterMs) {
+    dev.ui.samplingStatus.textContent = "0.0 Hz（受信停止）";
+    dev.ui.samplingStatus.style.color = "#d00";
+    samplingRateResult(dev, nowMs);
+    return;
+  }
+
   const rate = samplingRateResult(dev, nowMs);
   if (rate) {
     dev.ui.samplingStatus.textContent = `${rate.measuredHz.toFixed(1)} Hz（${rate.status}）`;
@@ -583,6 +617,15 @@ function updateNumericUi(dev, values, nowMs) {
     dev.ui.samplingStatus.textContent = "計算中";
     dev.ui.samplingStatus.style.color = "";
   }
+}
+
+function updateNumericUi(dev, values, nowMs) {
+  dev.pendingUi = values;
+  if (nowMs - dev.lastUiUpdateMs < updateIntervalMs("numericUiUpdateHz", 2)) return;
+
+  const latest = dev.pendingUi;
+  dev.ui.timeValue.textContent = latest.measureElapsedS.toFixed(2);
+  updateSamplingStatus(dev, nowMs);
 
   if (dev.type === "MAX") {
     dev.ui.distanceStatus.textContent = latest.irValue < distanceIrThreshold()
@@ -610,6 +653,7 @@ function clearDeviceData(id) {
   dev.pendingChartPoints = [];
   dev.pendingUi = null;
   dev.samplingEvents = [];
+  dev.lastSampleReceivedMs = null;
   dev.lastChartUpdateMs = 0;
   dev.lastUiUpdateMs = 0;
   
@@ -649,7 +693,7 @@ function handleMaxNotification(event, id) {
   dev.buffer = combined;
 
   const headerBytes = maxPacketHeaderBytes();
-  const chartPoints = [];
+  const chartPoints = isChartRenderingEnabled(dev) ? [] : null;
 
   while (dev.buffer.length >= headerBytes) {
     const formatId = dev.buffer[0];
@@ -738,11 +782,13 @@ function handleMaxNotification(event, id) {
         measure_elapsed_s: measureElapsedS
       });
 
-      chartPoints.push({
-        x: sensorRelativeElapsedS,
-        ir: irValue,
-        red: redValue
-      });
+      if (chartPoints) {
+        chartPoints.push({
+          x: sensorRelativeElapsedS,
+          ir: irValue,
+          red: redValue
+        });
+      }
 
       updateNumericUi(dev, {
         measureElapsedS,
@@ -756,7 +802,7 @@ function handleMaxNotification(event, id) {
     if (downloadAllBtn.disabled) updateUnifiedButtons();
   }
 
-  if (chartPoints.length > 0) {
+  if (chartPoints?.length > 0) {
     updateMaxChartBatch(id, chartPoints, Date.now());
   }
 }
@@ -780,7 +826,9 @@ function handleMlxNotification(event, id) {
 
   recordReceivedSamples(dev, 1, recvEpochMs);
   updateNumericUi(dev, { measureElapsedS, amb, obj }, recvEpochMs);
-  updateMlxChartData(id, measureElapsedS, obj, recvEpochMs);
+  if (isChartRenderingEnabled(dev)) {
+    updateMlxChartData(id, measureElapsedS, obj, recvEpochMs);
+  }
 
   // データ保存 (measure_elapsed_sは保存しない)
   dev.data.push({
@@ -812,6 +860,8 @@ function updateDeviceChartTitle(dev) {
 async function connectDevice(id) {
   const dev = devices[id];
   const selectedName = dev.ui.select.value;
+
+  if (isMeasurementBusy()) return;
   
   if (!selectedName) {
     alert("デバイス名を選択してください");
@@ -854,6 +904,7 @@ async function connectDevice(id) {
 
     // UI更新
     dev.ui.status.textContent = "接続済み";
+    dev.ui.status.style.color = "";
     dev.ui.deviceName.textContent = device.name;
     dev.ui.connect.disabled = true;
     dev.ui.select.disabled = true;
@@ -863,7 +914,13 @@ async function connectDevice(id) {
 
     // 切断時処理
     device.addEventListener('gattserverdisconnected', () => {
-      dev.ui.status.textContent = "未接続";
+      const disconnectedDuringMeasurement =
+        measurementState === MEASUREMENT_STATE.MEASURING;
+
+      dev.ui.status.textContent = disconnectedDuringMeasurement
+        ? "切断（他デバイスは計測継続中）"
+        : "未接続";
+      dev.ui.status.style.color = disconnectedDuringMeasurement ? "#d00" : "";
       dev.ui.deviceName.textContent = "-";
       dev.ui.connect.disabled = false;
       dev.ui.select.disabled = false;
@@ -873,14 +930,24 @@ async function connectDevice(id) {
       }
       dev.buffer = new Uint8Array();
       dev.measureStartEpochMs = null;
+      if (disconnectedDuringMeasurement) {
+        dev.ui.samplingStatus.textContent = "切断";
+        dev.ui.samplingStatus.style.color = "#d00";
+        console.warn(`${dev.name || dev.id} が切断されました．ほかのデバイスは計測を継続します．`);
+      }
       updateDeviceNameOptions(dev.type);
       updateUnifiedButtons();
+
+      if (measurementState === MEASUREMENT_STATE.STARTING) {
+        void stopMeasurement(`${dev.name || dev.id} が切断されたため，全デバイスの計測を停止しました．`);
+      }
     });
 
   } catch (e) {
     console.error(e);
     alert(`${id} の接続に失敗しました`);
     dev.ui.status.textContent = "未接続";
+    dev.ui.status.style.color = "";
   } finally {
     updateUnifiedButtons();
   }
@@ -888,6 +955,8 @@ async function connectDevice(id) {
 
 async function disconnectDevice(id) {
   const dev = devices[id];
+  if (isMeasurementBusy()) return;
+
   if (dev.device && dev.device.gatt.connected) {
     if (dev.characteristic) {
       try { await dev.characteristic.stopNotifications(); } catch(e){}
@@ -919,71 +988,146 @@ function allConnected() {
 function updateUnifiedButtons() {
   const active = Object.values(devices);
   const allReady = allConnected();
-  const measuring = isMeasuring();
+  const busy = isMeasurementBusy();
 
-  measureAllBtn.disabled = !allReady;
+  if (measurementState === MEASUREMENT_STATE.STARTING) {
+    measureAllBtn.textContent = "計測開始中...";
+    measureAllBtn.disabled = true;
+  } else if (measurementState === MEASUREMENT_STATE.MEASURING) {
+    measureAllBtn.textContent = "計測停止";
+    measureAllBtn.disabled = false;
+  } else if (measurementState === MEASUREMENT_STATE.STOPPING) {
+    measureAllBtn.textContent = "計測停止中...";
+    measureAllBtn.disabled = true;
+  } else {
+    measureAllBtn.textContent = "計測開始";
+    measureAllBtn.disabled = !allReady;
+  }
 
   const hasData = active.some(d => d.data.length > 0);
-  downloadAllBtn.disabled = !hasData;
+  downloadAllBtn.disabled = busy || !hasData;
 
   const maxCount = activeDevices("MAX").length;
   const mlxCount = activeDevices("MLX").length;
   const limit = maxDevicesPerSensor();
 
   addButtons.MAX.disabled =
-    measuring || maxCount >= limit || !hasAvailableDeviceName("MAX");
+    busy || maxCount >= limit || !hasAvailableDeviceName("MAX");
 
   addButtons.MLX.disabled =
-    measuring || mlxCount >= limit || !hasAvailableDeviceName("MLX");
+    busy || mlxCount >= limit || !hasAvailableDeviceName("MLX");
 
   countLabels.MAX.textContent = `${maxCount} / ${limit}`;
   countLabels.MLX.textContent = `${mlxCount} / ${limit}`;
 
   active.forEach(dev => {
-    if (dev.ui.close) dev.ui.close.disabled = measuring;
-    if (dev.ui.select && dev.device?.gatt?.connected) {
-      dev.ui.select.disabled = true;
-    }
+    const connected = !!dev.device?.gatt?.connected;
+    if (dev.ui.close) dev.ui.close.disabled = busy;
+    if (dev.ui.connect) dev.ui.connect.disabled = busy || connected;
+    if (dev.ui.disconnect) dev.ui.disconnect.disabled = busy || !connected;
+    if (dev.ui.select) dev.ui.select.disabled = busy || connected;
   });
 }
 
-measureAllBtn.addEventListener('click', async () => {
-  const isMeasuring = measureAllBtn.textContent.includes("停止");
-  
-  if (isMeasuring) {
-    // 停止処理
-    for (const id in devices) {
-      const dev = devices[id];
-      if (dev.characteristic) {
-        try { await dev.characteristic.stopNotifications(); } catch(e){}
-        dev.measureStartEpochMs = null;
-      }
-    }
-    measureAllBtn.textContent = "計測開始";
-    updateUnifiedButtons();
-    
-  } else {
-    // 開始処理
-    if(!allConnected()) {
-      alert("すべてのデバイスを接続してください");
-      return;
-    }
-    
-    resetAllCharts();
-    const startTime = Date.now();
+function notificationTargets() {
+  return Object.values(devices).filter(dev => dev.characteristic);
+}
 
-    for (const id in devices) {
-      clearDeviceData(id);
-      devices[id].measureStartEpochMs = startTime;
-    }
+async function stopNotificationsForAll() {
+  const targets = notificationTargets();
+  const results = await Promise.allSettled(
+    targets.map(dev => dev.characteristic.stopNotifications())
+  );
 
-    await Promise.all(
-      Object.values(devices)
-        .filter(dev => dev.characteristic)
-        .map(dev => dev.characteristic.startNotifications())
-    );
-    measureAllBtn.textContent = "計測停止";
+  return results
+    .map((result, index) => ({ result, dev: targets[index] }))
+    .filter(({ result }) => result.status === "rejected");
+}
+
+async function startMeasurement() {
+  if (measurementState !== MEASUREMENT_STATE.IDLE) return;
+
+  if (!allConnected()) {
+    alert("すべてのデバイスを接続してください");
+    return;
+  }
+
+  measurementState = MEASUREMENT_STATE.STARTING;
+  const operationId = ++measurementOperationId;
+  updateUnifiedButtons();
+
+  resetAllCharts();
+  const startTime = Date.now();
+
+  Object.keys(devices).forEach(id => {
+    clearDeviceData(id);
+    devices[id].measureStartEpochMs = startTime;
+  });
+
+  const targets = notificationTargets();
+  const results = await Promise.allSettled(
+    targets.map(dev => dev.characteristic.startNotifications())
+  );
+
+  if (
+    operationId !== measurementOperationId ||
+    measurementState !== MEASUREMENT_STATE.STARTING
+  ) {
+    await stopNotificationsForAll();
+    return;
+  }
+
+  const failedDevices = results
+    .map((result, index) => ({ result, dev: targets[index] }))
+    .filter(({ result }) => result.status === "rejected")
+    .map(({ dev }) => dev.name || dev.id);
+
+  if (failedDevices.length > 0) {
+    Object.values(devices).forEach(dev => {
+      dev.measureStartEpochMs = null;
+    });
+    await stopNotificationsForAll();
+    measurementState = MEASUREMENT_STATE.IDLE;
     updateUnifiedButtons();
+    alert(`Notifyを開始できませんでした：${failedDevices.join("，")}`);
+    return;
+  }
+
+  measurementState = MEASUREMENT_STATE.MEASURING;
+  updateUnifiedButtons();
+}
+
+async function stopMeasurement(message = "") {
+  if (
+    measurementState === MEASUREMENT_STATE.IDLE ||
+    measurementState === MEASUREMENT_STATE.STOPPING
+  ) return;
+
+  measurementState = MEASUREMENT_STATE.STOPPING;
+  const operationId = ++measurementOperationId;
+
+  Object.values(devices).forEach(dev => {
+    dev.measureStartEpochMs = null;
+  });
+  updateUnifiedButtons();
+
+  const failures = await stopNotificationsForAll();
+  if (operationId !== measurementOperationId) return;
+
+  measurementState = MEASUREMENT_STATE.IDLE;
+  updateUnifiedButtons();
+
+  if (message) alert(message);
+  if (failures.length > 0) {
+    console.warn("一部デバイスのNotify停止に失敗しました:", failures);
+  }
+}
+
+measureAllBtn.addEventListener("click", () => {
+  if (measurementState === MEASUREMENT_STATE.IDLE) {
+    void startMeasurement();
+  } else if (measurementState === MEASUREMENT_STATE.MEASURING) {
+    void stopMeasurement();
   }
 });
 
