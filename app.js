@@ -52,6 +52,11 @@ function maxDevicesPerSensor() {
   return CONFIG.app.maxDevicesPerSensor ?? 5;
 }
 
+function updateIntervalMs(configKey, fallbackHz) {
+  const hz = Number(CONFIG.app[configKey] ?? fallbackHz);
+  return 1000 / Math.max(0.1, hz);
+}
+
 function isMeasuring() {
   return measureAllBtn.textContent.includes("停止");
 }
@@ -147,10 +152,23 @@ const countLabels = {
 // ===== グローバルUI =====
 const measureAllBtn = document.getElementById("measure-all");
 const downloadAllBtn = document.getElementById("download-all");
+const toggleAllChartsBtn = document.getElementById("toggle-all-charts");
+let allChartsEnabled = true;
 
 // ===== 初期化処理 (プルダウン生成) =====
 function init() {
   applyAppConfig();
+
+  allChartsEnabled = CONFIG.app.chartsEnabledByDefault !== false;
+  toggleAllChartsBtn.addEventListener("click", () => {
+    allChartsEnabled = !allChartsEnabled;
+    Object.values(devices).forEach(dev => {
+      dev.pendingChartPoints = [];
+      applyChartVisibility(dev);
+    });
+    updateAllChartsButton();
+  });
+  updateAllChartsButton();
 
   addButtons.MAX.addEventListener("click", () => createDeviceBox("MAX"));
   addButtons.MLX.addEventListener("click", () => createDeviceBox("MLX"));
@@ -195,6 +213,8 @@ function createDeviceBox(type) {
       <div class="row">時間: <span id="${id}-timeValue" class="val">-</span> s</div>
       <div class="row">距離: <span id="${id}-distanceStatus">-</span></div>
       <div class="row">形式: <span id="${id}-formatStatus">-</span></div>
+      <div class="row">受信状態: <span id="${id}-samplingStatus">-</span></div>
+      <button id="${id}-chart-toggle" class="chart-toggle-btn" aria-pressed="true">グラフ OFF</button>
       <div class="device-chart-container">
         <canvas id="${id}-chart"></canvas>
       </div>
@@ -215,6 +235,8 @@ function createDeviceBox(type) {
       <div class="row">Amb: <span id="${id}-ambValue" class="val">-</span> °C</div>
       <div class="row">Obj: <span id="${id}-objValue" class="val">-</span> °C</div>
       <div class="row">時間: <span id="${id}-timeValue" class="val">-</span> s</div>
+      <div class="row">受信状態: <span id="${id}-samplingStatus">-</span></div>
+      <button id="${id}-chart-toggle" class="chart-toggle-btn" aria-pressed="true">グラフ OFF</button>
       <div class="device-chart-container">
         <canvas id="${id}-chart"></canvas>
       </div>
@@ -237,7 +259,12 @@ function createDeviceBox(type) {
     eventHandler: null,
     chart: null,
     sensorBaseMs: null,
+    chartEnabled: CONFIG.app.chartsEnabledByDefault !== false,
+    pendingChartPoints: [],
+    pendingUi: null,
+    samplingEvents: [],
     lastChartUpdateMs: 0,
+    lastUiUpdateMs: 0,
     ui: {
       box,
       title: document.getElementById(`${id}-title`),
@@ -250,8 +277,11 @@ function createDeviceBox(type) {
       timeValue: document.getElementById(`${id}-timeValue`),
       distanceStatus: document.getElementById(`${id}-distanceStatus`),
       formatStatus: document.getElementById(`${id}-formatStatus`),
+      samplingStatus: document.getElementById(`${id}-samplingStatus`),
       ambValue: document.getElementById(`${id}-ambValue`),
       objValue: document.getElementById(`${id}-objValue`),
+      chartToggle: document.getElementById(`${id}-chart-toggle`),
+      chartContainer: box.querySelector(".device-chart-container"),
       chartCanvas: document.getElementById(`${id}-chart`)
     }
   };
@@ -272,6 +302,13 @@ function createDeviceBox(type) {
   updateDeviceNameOptions(type);
 
   createDeviceChart(dev);
+
+  dev.ui.chartToggle.addEventListener("click", () => {
+    dev.chartEnabled = !dev.chartEnabled;
+    dev.pendingChartPoints = [];
+    applyChartVisibility(dev);
+  });
+  applyChartVisibility(dev);
 
   dev.ui.connect.addEventListener("click", () => connectDevice(id));
   dev.ui.disconnect.addEventListener("click", () => disconnectDevice(id));
@@ -397,6 +434,26 @@ function clearDeviceChart(dev) {
   dev.chart.update("none"); 
 }
 
+function isChartRenderingEnabled(dev) {
+  return allChartsEnabled && dev.chartEnabled;
+}
+
+function applyChartVisibility(dev) {
+  const visible = isChartRenderingEnabled(dev);
+  dev.ui.chartContainer.classList.toggle("chart-hidden", !visible);
+  dev.ui.chartToggle.textContent = dev.chartEnabled ? "グラフ OFF" : "グラフ ON";
+  dev.ui.chartToggle.setAttribute("aria-pressed", String(dev.chartEnabled));
+
+  if (visible && dev.chart) {
+    requestAnimationFrame(() => dev.chart.resize());
+  }
+}
+
+function updateAllChartsButton() {
+  toggleAllChartsBtn.textContent = allChartsEnabled ? "全グラフ OFF" : "全グラフ ON";
+  toggleAllChartsBtn.setAttribute("aria-pressed", String(allChartsEnabled));
+}
+
 async function removeDeviceBox(id) {
   const dev = devices[id];
   if (!dev) return;
@@ -423,15 +480,21 @@ async function removeDeviceBox(id) {
 }
 
 // 共通チャート更新関数
-function updateMaxChartBatch(id, points) {
+function updateMaxChartBatch(id, points, nowMs) {
   const dev = devices[id];
-  if (!dev || !dev.chart || points.length === 0) return;
+  if (!dev || !dev.chart || !isChartRenderingEnabled(dev) || points.length === 0) return;
 
+  dev.pendingChartPoints.push(...points);
   const maxPts = plotCount("MAX");
+  if (dev.pendingChartPoints.length > maxPts) {
+    dev.pendingChartPoints.splice(0, dev.pendingChartPoints.length - maxPts);
+  }
+  if (nowMs - dev.lastChartUpdateMs < updateIntervalMs("chartUpdateHz", 2)) return;
+
   const irDataset = dev.chart.data.datasets[0];
   const redDataset = dev.chart.data.datasets[1];
 
-  points.forEach(p => {
+  dev.pendingChartPoints.forEach(p => {
     irDataset.data.push({ x: p.x, y: p.ir });
     redDataset.data.push({ x: p.x, y: p.red });
   });
@@ -441,23 +504,101 @@ function updateMaxChartBatch(id, points) {
     redDataset.data.shift();
   }
 
+  dev.pendingChartPoints = [];
+  dev.lastChartUpdateMs = nowMs;
   dev.chart.update("none");
 }
 
-function updateMlxChartData(id, elapsedS, obj) {
+function updateMlxChartData(id, elapsedS, obj, nowMs) {
   const dev = devices[id];
-  if (!dev || !dev.chart) return;
+  if (!dev || !dev.chart || !isChartRenderingEnabled(dev)) return;
+
+  dev.pendingChartPoints.push({ x: elapsedS, y: obj });
+  if (nowMs - dev.lastChartUpdateMs < updateIntervalMs("chartUpdateHz", 2)) return;
 
   const maxPts = plotCount("MLX");
   const dataset = dev.chart.data.datasets[0];
 
-  dataset.data.push({ x: elapsedS, y: obj });
+  dataset.data.push(...dev.pendingChartPoints);
 
   if (dataset.data.length > maxPts) {
-    dataset.data.shift();
+    dataset.data.splice(0, dataset.data.length - maxPts);
   }
 
+  dev.pendingChartPoints = [];
+  dev.lastChartUpdateMs = nowMs;
   dev.chart.update("none");
+}
+
+function recordReceivedSamples(dev, sampleCount, nowMs) {
+  dev.samplingEvents.push({ timeMs: nowMs, count: sampleCount });
+}
+
+function samplingRateResult(dev, nowMs) {
+  const windowMs = (CONFIG.app.samplingRateWindowSeconds ?? 5) * 1000;
+  const cutoffMs = nowMs - windowMs;
+  while (dev.samplingEvents.length > 0 && dev.samplingEvents[0].timeMs < cutoffMs) {
+    dev.samplingEvents.shift();
+  }
+
+  if (dev.samplingEvents.length < 2) return null;
+
+  const firstMs = dev.samplingEvents[0].timeMs;
+  const elapsedS = Math.min(windowMs, nowMs - firstMs) / 1000;
+  if (elapsedS <= 0) return null;
+
+  // 最初の受信イベントを時間計測の起点とし，以降に届いたサンプル数で算出する．
+  const samples = dev.samplingEvents
+    .slice(1)
+    .reduce((sum, event) => sum + event.count, 0);
+  const measuredHz = samples / elapsedS;
+  const expectedHz = Number(sensorConfig(dev.type).samplingRateHz);
+  const minRatio = CONFIG.app.samplingRateNormalMinRatio ?? 0.9;
+  const maxRatio = CONFIG.app.samplingRateNormalMaxRatio ?? 1.1;
+  let status = "正常";
+  let color = "#046307";
+
+  if (measuredHz < expectedHz * minRatio) {
+    status = "低下";
+    color = "#d00";
+  } else if (measuredHz > expectedHz * maxRatio) {
+    status = "過剰";
+    color = "#b05a00";
+  }
+
+  return { measuredHz, status, color };
+}
+
+function updateNumericUi(dev, values, nowMs) {
+  dev.pendingUi = values;
+  if (nowMs - dev.lastUiUpdateMs < updateIntervalMs("numericUiUpdateHz", 2)) return;
+
+  const latest = dev.pendingUi;
+  dev.ui.timeValue.textContent = latest.measureElapsedS.toFixed(2);
+  const rate = samplingRateResult(dev, nowMs);
+  if (rate) {
+    dev.ui.samplingStatus.textContent = `${rate.measuredHz.toFixed(1)} Hz（${rate.status}）`;
+    dev.ui.samplingStatus.style.color = rate.color;
+  } else {
+    dev.ui.samplingStatus.textContent = "計算中";
+    dev.ui.samplingStatus.style.color = "";
+  }
+
+  if (dev.type === "MAX") {
+    dev.ui.distanceStatus.textContent = latest.irValue < distanceIrThreshold()
+      ? "離れています"
+      : "正常";
+    dev.ui.distanceStatus.style.color = latest.irValue < distanceIrThreshold()
+      ? "#d00"
+      : "#046307";
+    if (dev.ui.formatStatus) dev.ui.formatStatus.textContent = latest.formatName;
+  } else {
+    dev.ui.ambValue.textContent = latest.amb.toFixed(4);
+    dev.ui.objValue.textContent = latest.obj.toFixed(4);
+  }
+
+  dev.pendingUi = null;
+  dev.lastUiUpdateMs = nowMs;
 }
 
 function clearDeviceData(id) {
@@ -466,9 +607,15 @@ function clearDeviceData(id) {
   dev.buffer = new Uint8Array();
   dev.measureStartEpochMs = null;
   dev.sensorBaseMs = null;
+  dev.pendingChartPoints = [];
+  dev.pendingUi = null;
+  dev.samplingEvents = [];
   dev.lastChartUpdateMs = 0;
+  dev.lastUiUpdateMs = 0;
   
   dev.ui.timeValue.textContent = "-";
+  dev.ui.samplingStatus.textContent = "-";
+  dev.ui.samplingStatus.style.color = "";
   if (dev.type === 'MAX') dev.ui.distanceStatus.textContent = "-";
   if (dev.type === 'MAX' && dev.ui.formatStatus) dev.ui.formatStatus.textContent = "-";
   if (dev.type === 'MLX') {
@@ -540,9 +687,8 @@ function handleMaxNotification(event, id) {
       break;
     }
 
-    if (dev.ui.formatStatus) {
-      dev.ui.formatStatus.textContent = format.hasAccel ? "PPG + Accel" : "PPG";
-    }
+    const packetRecvEpochMs = Date.now();
+    recordReceivedSamples(dev, sampleCount, packetRecvEpochMs);
 
     for (let i = 0; i < sampleCount; i++) {
       const offset = headerBytes + i * sampleBytes;
@@ -580,14 +726,6 @@ function handleMaxNotification(event, id) {
       const measureElapsedS =
         (recvEpochMs - dev.measureStartEpochMs) / 1000;
 
-      if (irValue < distanceIrThreshold()) {
-        dev.ui.distanceStatus.textContent = "離れています";
-        dev.ui.distanceStatus.style.color = "#d00";
-      } else {
-        dev.ui.distanceStatus.textContent = "正常";
-        dev.ui.distanceStatus.style.color = "#046307";
-      }
-
       dev.data.push({
         irValue,
         redValue,
@@ -606,7 +744,11 @@ function handleMaxNotification(event, id) {
         red: redValue
       });
 
-      dev.ui.timeValue.textContent = measureElapsedS.toFixed(2);
+      updateNumericUi(dev, {
+        measureElapsedS,
+        irValue,
+        formatName: format.hasAccel ? "PPG + Accel" : "PPG"
+      }, recvEpochMs);
     }
 
     dev.buffer = dev.buffer.slice(packetBytes);
@@ -615,7 +757,7 @@ function handleMaxNotification(event, id) {
   }
 
   if (chartPoints.length > 0) {
-    updateMaxChartBatch(id, chartPoints);
+    updateMaxChartBatch(id, chartPoints, Date.now());
   }
 }
 
@@ -636,11 +778,9 @@ function handleMlxNotification(event, id) {
   const measureElapsedS = (recvEpochMs - dev.measureStartEpochMs) / 1000;
   const sensorElapsedS = sensorElapsedMs / 1000;
 
-  dev.ui.ambValue.textContent = amb.toFixed(4);
-  dev.ui.objValue.textContent = obj.toFixed(4);
-  dev.ui.timeValue.textContent = measureElapsedS.toFixed(2);
-
-  updateMlxChartData(id, measureElapsedS, obj);
+  recordReceivedSamples(dev, 1, recvEpochMs);
+  updateNumericUi(dev, { measureElapsedS, amb, obj }, recvEpochMs);
+  updateMlxChartData(id, measureElapsedS, obj, recvEpochMs);
 
   // データ保存 (measure_elapsed_sは保存しない)
   dev.data.push({
@@ -952,69 +1092,11 @@ function downloadCsv(deviceName, data, type, timestamp) {
   URL.revokeObjectURL(url);
 }
 
-downloadAllBtn.addEventListener("click", async () => {
+downloadAllBtn.addEventListener("click", () => {
   const timestamp = formatTimestampForFilename();
 
-  const targetDevices = Object.values(devices)
-    .filter(dev => dev.data.length > 0);
-
-  if (targetDevices.length === 0) {
-    alert("ダウンロードできるデータがありません．");
-    return;
-  }
-
-  const originalText = downloadAllBtn.textContent;
-
-  downloadAllBtn.disabled = true;
-  downloadAllBtn.textContent = "ZIP生成中...";
-
-  try {
-    const zip = new JSZip();
-
-    targetDevices.forEach(dev => {
-      const deviceName = dev.name || dev.id.toUpperCase();
-
-      const rows = buildRows(dev.data, dev.type);
-      const headers = csvHeaders(dev.type);
-      const csv = rowsToCsv(rows, headers);
-
-      const safeName = sanitizeFilename(deviceName);
-      const filename = `${safeName}_${timestamp}.csv`;
-
-      // Excelでの文字化け防止用BOM付きCSV
-      zip.file(filename, "\uFEFF" + csv);
-    });
-
-    const zipBlob = await zip.generateAsync({
-      type: "blob",
-      compression: "DEFLATE",
-      compressionOptions: {
-        level: 6
-      }
-    });
-
-    const zipFilename = `VitBuds_${timestamp}.zip`;
-
-    const url = URL.createObjectURL(zipBlob);
-    const a = document.createElement("a");
-
-    a.href = url;
-    a.download = zipFilename;
-
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-
-    setTimeout(() => {
-      URL.revokeObjectURL(url);
-    }, 1000);
-
-  } catch (e) {
-    console.error("ZIP生成エラー:", e);
-    alert("ZIPファイルの生成に失敗しました．");
-
-  } finally {
-    downloadAllBtn.textContent = originalText;
-    updateUnifiedButtons();
-  }
+  Object.values(devices).forEach(dev => {
+    const deviceName = dev.name || dev.id.toUpperCase();
+    downloadCsv(deviceName, dev.data, dev.type, timestamp);
+  });
 });

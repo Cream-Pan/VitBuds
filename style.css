@@ -216,3 +216,16 @@ select.device-select {
   max-height: 100% !important;
   max-height: none !important;
 }
+
+.device-chart-container.chart-hidden {
+  display: none;
+}
+
+.chart-toggle-btn {
+  background-color: #52616b;
+}
+
+.box .chart-toggle-btn {
+  margin-top: 0.6rem;
+  width: 100%;
+}

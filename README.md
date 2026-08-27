@@ -144,6 +144,10 @@ Ambient 温度，Object 温度，Raw Ambient，Raw Object を受信する．
 | `app.version` | バージョン |
 | `app.requireAllDevices` | 追加されている Box すべての接続を計測開始条件にするか |
 | `app.maxDevicesPerSensor` | MAX/MLX それぞれの最大 Box 数 |
+| `app.chartsEnabledByDefault` | 起動時のグラフ表示状態 |
+| `app.chartUpdateHz` | グラフの描画頻度 [Hz] |
+| `app.numericUiUpdateHz` | 数値表示の更新頻度 [Hz] |
+| `app.samplingRateWindowSeconds` | 実測受信レートの計算窓 [s] |
 | `sensors.MAX.serviceUUID` | MAX の BLE Service UUID |
 | `sensors.MAX.characteristicUUID` | MAX の BLE Characteristic UUID |
 | `sensors.MAX.sampleByteSize` | MAX の1サンプルのバイト数 |
@@ -155,6 +159,7 @@ Ambient 温度，Object 温度，Raw Ambient，Raw Object を受信する．
 | `sensors.MLX.serviceUUID` | MLX の BLE Service UUID |
 | `sensors.MLX.characteristicUUID` | MLX の BLE Characteristic UUID |
 | `sensors.MLX.sampleByteSize` | MLX の1サンプルのバイト数 |
+| `sensors.MLX.samplingRateHz` | MLX の想定サンプリングレート [Hz] |
 | `sensors.MLX.plotCount` | MLX グラフに表示する最大点数 |
 | `sensors.MLX.deviceNames` | MLX の候補デバイス名 |
 
@@ -228,6 +233,7 @@ MLX は温度データ用 Characteristic から通知を受信する．
 
 * 計測開始 / 計測停止
 * 一括ダウンロード（CSV）
+* 全グラフ ON/OFF
 
 画面下部には，MAXパネルとMLXパネルを配置する．
 各パネルには，デバイス追加ボタンとデバイスBox一覧を表示する．
@@ -297,9 +303,13 @@ MAXでは，デバイスBoxごとに個別のグラフを表示する．
 - IR
 - RED
 
+各デバイスBoxのボタンで個別にグラフをON/OFFできる．全体ボタンをOFFにした場合は，すべてのグラフ描画を停止する．グラフをOFFにしても，BLE受信，データ保存，CSV出力は継続する．
+
 IR と RED は別の Y 軸で表示する．横軸には，マイコン側の `SensorElapsed_ms` を基準にした相対時間を用いる．
 
-MAX は1回の Notify に複数サンプルをまとめて送るため，WebApp 側では受信したバイト列を 12 byte ごとに切り出し，すべてのサンプルをグラフに追加する．Chart.js の更新は Notify ごとにまとめて実行するため，CSV には100 Hzの全サンプルを保存しつつ，描画負荷を抑える．
+MAX は1回の Notify に複数サンプルをまとめて送るため，WebApp 側ではパケット形式に応じて全サンプルを復号・保存する．Chart.js の更新はセンサ取得頻度から分離し，`app.chartUpdateHz`で指定した頻度に制限する．数値表示も`app.numericUiUpdateHz`で指定した頻度に制限する．
+
+各デバイスBoxには，直近の受信サンプル数から算出した実測サンプリングレートを表示する．MAXではNotify回数ではなく，パケット内のサンプル数を使用する．MLXの想定値は2 Hzである．
 
 MAX グラフの表示点数は，`sensors.MAX.samplingRateHz × sensors.MAX.chartVisibleSeconds` により決定する．
 
