@@ -280,6 +280,11 @@ function createDeviceBox(type) {
     data: [],
     buffer: new Uint8Array(),
     eventHandler: null,
+    disconnectHandler: null,
+    disconnectedDuringMeasurement: false,
+    reconnectInProgress: false,
+    reconnectAttemptId: 0,
+    connectionInterruptions: [],
     chart: null,
     sensorBaseMs: null,
     chartEnabled: allChartsEnabled,
@@ -654,6 +659,10 @@ function clearDeviceData(id) {
   dev.pendingUi = null;
   dev.samplingEvents = [];
   dev.lastSampleReceivedMs = null;
+  dev.disconnectedDuringMeasurement = false;
+  dev.reconnectInProgress = false;
+  dev.reconnectAttemptId += 1;
+  dev.connectionInterruptions = [];
   dev.lastChartUpdateMs = 0;
   dev.lastUiUpdateMs = 0;
   
@@ -857,9 +866,170 @@ function updateDeviceChartTitle(dev) {
 }
 
 // ===== 接続・切断ロジック =====
+function ensureNotificationHandler(dev, id) {
+  if (dev.eventHandler) return;
+
+  if (dev.type === "MAX") {
+    dev.eventHandler = event => handleMaxNotification(event, id);
+  } else {
+    dev.eventHandler = event => handleMlxNotification(event, id);
+  }
+}
+
+function registerDisconnectHandler(dev, id) {
+  if (!dev.disconnectHandler) {
+    dev.disconnectHandler = event => handleGattDisconnected(event, id);
+  }
+  dev.device.addEventListener("gattserverdisconnected", dev.disconnectHandler);
+}
+
+function handleGattDisconnected(event, id) {
+  const dev = devices[id];
+  if (!dev || event.target !== dev.device) return;
+
+  const disconnectedDuringMeasurement =
+    measurementState === MEASUREMENT_STATE.MEASURING;
+  const disconnectedAtEpochMs = Date.now();
+
+  if (dev.characteristic && dev.eventHandler) {
+    try {
+      dev.characteristic.removeEventListener("characteristicvaluechanged", dev.eventHandler);
+    } catch {}
+  }
+
+  dev.characteristic = null;
+  dev.buffer = new Uint8Array();
+  dev.pendingChartPoints = [];
+  dev.pendingUi = null;
+  dev.samplingEvents = [];
+  dev.lastSampleReceivedMs = null;
+  dev.reconnectInProgress = false;
+
+  if (disconnectedDuringMeasurement) {
+    if (!dev.disconnectedDuringMeasurement) {
+      dev.connectionInterruptions.push({
+        disconnectedAtEpochMs,
+        reconnectedAtEpochMs: null
+      });
+    }
+    dev.disconnectedDuringMeasurement = true;
+    // dev.dataとmeasureStartEpochMsは，同一計測へ復帰するため保持する．
+    dev.ui.status.textContent = "切断（再接続待ち）";
+    dev.ui.status.style.color = "#d00";
+    dev.ui.deviceName.textContent = dev.device.name || dev.name;
+    dev.ui.samplingStatus.textContent = "切断";
+    dev.ui.samplingStatus.style.color = "#d00";
+    console.warn(`${dev.name || dev.id} が切断されました．ほかのデバイスは計測を継続します．`);
+  } else {
+    dev.disconnectedDuringMeasurement = false;
+    dev.measureStartEpochMs = null;
+    dev.ui.status.textContent = "未接続";
+    dev.ui.status.style.color = "";
+    dev.ui.deviceName.textContent = "-";
+  }
+
+  updateDeviceNameOptions(dev.type);
+  updateUnifiedButtons();
+
+  if (measurementState === MEASUREMENT_STATE.STARTING) {
+    void stopMeasurement(`${dev.name || dev.id} が切断されたため，全デバイスの計測開始を中止しました．`);
+  }
+}
+
+async function reconnectDevice(id) {
+  const dev = devices[id];
+  if (
+    !dev ||
+    measurementState !== MEASUREMENT_STATE.MEASURING ||
+    !dev.disconnectedDuringMeasurement ||
+    !dev.device ||
+    dev.reconnectInProgress
+  ) return;
+
+  dev.reconnectInProgress = true;
+  const reconnectAttemptId = ++dev.reconnectAttemptId;
+  dev.ui.status.textContent = "再接続中...";
+  dev.ui.status.style.color = "#b05a00";
+  updateUnifiedButtons();
+
+  try {
+    const server = await dev.device.gatt.connect();
+    if (
+      measurementState !== MEASUREMENT_STATE.MEASURING ||
+      reconnectAttemptId !== dev.reconnectAttemptId ||
+      !dev.device.gatt.connected
+    ) {
+      if (server.connected) server.disconnect();
+      return;
+    }
+
+    const service = await server.getPrimaryService(dev.serviceUUID);
+    const characteristic = await service.getCharacteristic(dev.charUUID);
+
+    ensureNotificationHandler(dev, id);
+    characteristic.addEventListener("characteristicvaluechanged", dev.eventHandler);
+    dev.characteristic = characteristic;
+    await characteristic.startNotifications();
+
+    if (
+      measurementState !== MEASUREMENT_STATE.MEASURING ||
+      reconnectAttemptId !== dev.reconnectAttemptId
+    ) {
+      try { await characteristic.stopNotifications(); } catch {}
+      characteristic.removeEventListener("characteristicvaluechanged", dev.eventHandler);
+      dev.characteristic = null;
+      if (dev.device.gatt.connected) dev.device.gatt.disconnect();
+      return;
+    }
+
+    const interruption =
+      dev.connectionInterruptions[dev.connectionInterruptions.length - 1];
+    if (interruption && interruption.reconnectedAtEpochMs === null) {
+      interruption.reconnectedAtEpochMs = Date.now();
+    }
+
+    dev.buffer = new Uint8Array();
+    dev.pendingChartPoints = [];
+    dev.pendingUi = null;
+    dev.samplingEvents = [];
+    dev.lastSampleReceivedMs = null;
+    dev.disconnectedDuringMeasurement = false;
+    dev.ui.status.textContent = "再接続済み（計測継続中）";
+    dev.ui.status.style.color = "#046307";
+    dev.ui.deviceName.textContent = dev.device.name || dev.name;
+    dev.ui.samplingStatus.textContent = "計算中";
+    dev.ui.samplingStatus.style.color = "";
+  } catch (error) {
+    console.error(`${dev.name || dev.id} の再接続に失敗しました:`, error);
+
+    if (dev.characteristic && dev.eventHandler) {
+      try {
+        dev.characteristic.removeEventListener("characteristicvaluechanged", dev.eventHandler);
+      } catch {}
+    }
+    dev.characteristic = null;
+    dev.ui.status.textContent = "再接続失敗（再試行可能）";
+    dev.ui.status.style.color = "#d00";
+    if (dev.device.gatt.connected) dev.device.gatt.disconnect();
+  } finally {
+    if (reconnectAttemptId === dev.reconnectAttemptId) {
+      dev.reconnectInProgress = false;
+    }
+    updateUnifiedButtons();
+  }
+}
+
 async function connectDevice(id) {
   const dev = devices[id];
   const selectedName = dev.ui.select.value;
+
+  if (
+    measurementState === MEASUREMENT_STATE.MEASURING &&
+    dev.disconnectedDuringMeasurement
+  ) {
+    await reconnectDevice(id);
+    return;
+  }
 
   if (isMeasurementBusy()) return;
   
@@ -887,19 +1057,20 @@ async function connectDevice(id) {
       optionalServices: [dev.serviceUUID]
     });
     
+    if (dev.device && dev.disconnectHandler) {
+      dev.device.removeEventListener("gattserverdisconnected", dev.disconnectHandler);
+    }
+
     dev.device = device;
     dev.name = selectedName; // 選択された名前を記憶
+    registerDisconnectHandler(dev, id);
     
     const server = await device.gatt.connect();
     const service = await server.getPrimaryService(dev.serviceUUID);
     dev.characteristic = await service.getCharacteristic(dev.charUUID);
 
     // ハンドラ設定
-    if (dev.type === 'MAX') {
-      dev.eventHandler = (e) => handleMaxNotification(e, id);
-    } else {
-      dev.eventHandler = (e) => handleMlxNotification(e, id);
-    }
+    ensureNotificationHandler(dev, id);
     dev.characteristic.addEventListener('characteristicvaluechanged', dev.eventHandler);
 
     // UI更新
@@ -911,37 +1082,6 @@ async function connectDevice(id) {
     dev.ui.disconnect.disabled = false;
     updateDeviceChartTitle(dev);
     updateDeviceNameOptions(dev.type);
-
-    // 切断時処理
-    device.addEventListener('gattserverdisconnected', () => {
-      const disconnectedDuringMeasurement =
-        measurementState === MEASUREMENT_STATE.MEASURING;
-
-      dev.ui.status.textContent = disconnectedDuringMeasurement
-        ? "切断（他デバイスは計測継続中）"
-        : "未接続";
-      dev.ui.status.style.color = disconnectedDuringMeasurement ? "#d00" : "";
-      dev.ui.deviceName.textContent = "-";
-      dev.ui.connect.disabled = false;
-      dev.ui.select.disabled = false;
-      dev.ui.disconnect.disabled = true;
-      if(dev.eventHandler) {
-         try{ dev.characteristic.removeEventListener('characteristicvaluechanged', dev.eventHandler); }catch{}
-      }
-      dev.buffer = new Uint8Array();
-      dev.measureStartEpochMs = null;
-      if (disconnectedDuringMeasurement) {
-        dev.ui.samplingStatus.textContent = "切断";
-        dev.ui.samplingStatus.style.color = "#d00";
-        console.warn(`${dev.name || dev.id} が切断されました．ほかのデバイスは計測を継続します．`);
-      }
-      updateDeviceNameOptions(dev.type);
-      updateUnifiedButtons();
-
-      if (measurementState === MEASUREMENT_STATE.STARTING) {
-        void stopMeasurement(`${dev.name || dev.id} が切断されたため，全デバイスの計測を停止しました．`);
-      }
-    });
 
   } catch (e) {
     console.error(e);
@@ -1022,15 +1162,27 @@ function updateUnifiedButtons() {
 
   active.forEach(dev => {
     const connected = !!dev.device?.gatt?.connected;
+    const canReconnect =
+      measurementState === MEASUREMENT_STATE.MEASURING &&
+      dev.disconnectedDuringMeasurement &&
+      !!dev.device;
+
     if (dev.ui.close) dev.ui.close.disabled = busy;
-    if (dev.ui.connect) dev.ui.connect.disabled = busy || connected;
+    if (dev.ui.connect) {
+      dev.ui.connect.textContent = canReconnect
+        ? (dev.reconnectInProgress ? "再接続中..." : "再接続")
+        : "接続";
+      dev.ui.connect.disabled = connected || (busy && !canReconnect) || dev.reconnectInProgress;
+    }
     if (dev.ui.disconnect) dev.ui.disconnect.disabled = busy || !connected;
     if (dev.ui.select) dev.ui.select.disabled = busy || connected;
   });
 }
 
 function notificationTargets() {
-  return Object.values(devices).filter(dev => dev.characteristic);
+  return Object.values(devices).filter(
+    dev => dev.characteristic && dev.device?.gatt?.connected
+  );
 }
 
 async function stopNotificationsForAll() {
@@ -1108,6 +1260,8 @@ async function stopMeasurement(message = "") {
 
   Object.values(devices).forEach(dev => {
     dev.measureStartEpochMs = null;
+    dev.reconnectAttemptId += 1;
+    dev.reconnectInProgress = false;
   });
   updateUnifiedButtons();
 
@@ -1115,6 +1269,17 @@ async function stopMeasurement(message = "") {
   if (operationId !== measurementOperationId) return;
 
   measurementState = MEASUREMENT_STATE.IDLE;
+  Object.values(devices).forEach(dev => {
+    dev.disconnectedDuringMeasurement = false;
+    if (dev.device?.gatt?.connected) {
+      dev.ui.status.textContent = "接続済み";
+      dev.ui.status.style.color = "";
+    } else {
+      dev.ui.status.textContent = "未接続";
+      dev.ui.status.style.color = "";
+      dev.ui.deviceName.textContent = "-";
+    }
+  });
   updateUnifiedButtons();
 
   if (message) alert(message);
@@ -1131,7 +1296,7 @@ measureAllBtn.addEventListener("click", () => {
   }
 });
 
-// ===== ダウンロード (CSV) =====
+// ===== ダウンロード (ZIP内にデバイス別CSVを保存) =====
 function formatTimestampForFilename(date = new Date()) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}-${pad(date.getHours())}-${pad(date.getMinutes())}`;
@@ -1236,11 +1401,58 @@ function downloadCsv(deviceName, data, type, timestamp) {
   URL.revokeObjectURL(url);
 }
 
-downloadAllBtn.addEventListener("click", () => {
+downloadAllBtn.addEventListener("click", async () => {
   const timestamp = formatTimestampForFilename();
 
-  Object.values(devices).forEach(dev => {
-    const deviceName = dev.name || dev.id.toUpperCase();
-    downloadCsv(deviceName, dev.data, dev.type, timestamp);
-  });
+  const targetDevices = Object.values(devices)
+    .filter(dev => dev.data.length > 0);
+
+  if (targetDevices.length === 0) {
+    alert("ダウンロードできるデータがありません．");
+    return;
+  }
+
+  if (typeof JSZip === "undefined") {
+    alert("ZIP生成ライブラリを読み込めませんでした．通信状態を確認してください．");
+    return;
+  }
+
+  const originalText = downloadAllBtn.textContent;
+  downloadAllBtn.disabled = true;
+  downloadAllBtn.textContent = "ZIP生成中...";
+
+  try {
+    const zip = new JSZip();
+
+    targetDevices.forEach(dev => {
+      const deviceName = dev.name || dev.id.toUpperCase();
+      const rows = buildRows(dev.data, dev.type);
+      const headers = csvHeaders(dev.type);
+      const csv = rowsToCsv(rows, headers);
+      const safeName = sanitizeFilename(deviceName);
+      const filename = `${safeName}_${timestamp}.csv`;
+
+      zip.file(filename, "\uFEFF" + csv);
+    });
+
+    const zipBlob = await zip.generateAsync({
+      type: "blob",
+      compression: "DEFLATE",
+      compressionOptions: { level: 6 }
+    });
+    const url = URL.createObjectURL(zipBlob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `VitBuds_${timestamp}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    console.error("ZIP生成エラー:", error);
+    alert("ZIPファイルの生成に失敗しました．");
+  } finally {
+    downloadAllBtn.textContent = originalText;
+    updateUnifiedButtons();
+  }
 });
